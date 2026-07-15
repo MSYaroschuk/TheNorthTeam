@@ -148,11 +148,12 @@ def main_loop():
             motor.angle(motor_angle)
             previous_error = error
             last_control_time = now
+            v_ang = (rpm * 2 * 3.1415)/60
 
         handle_keyboard()
 
         sys.stdout.write(
-            f"\rRPM: {rpm:6.1f} | Target: {target_rpm:6.1f} | Angle: {motor_angle:5.2f}"
+            f"\rRPM: {rpm:6.1f} | Angular velocity: {v_ang:6.1f} | Target: {target_rpm:6.1f} | Angle: {motor_angle:5.2f}"
         )
         sys.stdout.flush()
         time.sleep(0.001)
