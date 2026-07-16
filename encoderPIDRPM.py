@@ -148,12 +148,20 @@ def main_loop():
             motor.angle(motor_angle)
             previous_error = error
             last_control_time = now
-            v_ang = (rpm * 2 * 3.1415)/60
-
+            theta = math.radians(45)
+            v0 = math.pi * wheel_diameter_m * (rpm / 60) #very optimistic velocity estimation
+            v0x = v0 * math.cos(theta)
+            v0y = v0 * math.sin(theta)
+            a_quad = -0.5 * g
+            b_quad = v0y
+            c_quad = y0
+            t = (-b_quad - math.sqrt(b_quad**2 - 4 * a_quad * c_quad)) / (2 * a_quad)
+            distance = v0x * t
+     
         handle_keyboard()
 
         sys.stdout.write(
-            f"\rRPM: {rpm:6.1f} | Angular velocity: {v_ang:6.1f} | Target: {target_rpm:6.1f} | Angle: {motor_angle:5.2f}"
+            f"\rRPM: {rpm:6.1f} | Angular velocity: {v_ang:6.1f} | Ball Velocity: {vel:6.1f} | Target: {target_rpm:6.1f} | Angle: {motor_angle:5.2f} | maybe distance: {distance:6.1f}"
         )
         sys.stdout.flush()
         time.sleep(0.001)
