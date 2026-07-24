@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # teleop_shooter.py
-# Teleop drive + intake + feeder gate + CLOSED-LOOP PID shooter.
+# Teleop drive + intake + continuous-servo feeder + CLOSED-LOOP PID shooter.
 #
 # v1.0 - practice field build
 # (C) Team Northeast
@@ -48,11 +48,11 @@ if CHASSIS_LAYOUT == "4motor":
     LEFT_DRIVE_CH = [0, 1]
     RIGHT_DRIVE_CH = [2, 3]
     INTAKE_CH = 4
-    GATE_CH = 5
+    FEEDER_CH = 5
     SHOOTER_CH = [6, 7]
 else:
     SHOOTER_CH = [0, 1]
-    GATE_CH = 2
+    FEEDER_CH = 2
     INTAKE_CH = 3
     LEFT_DRIVE_CH = [4]
     RIGHT_DRIVE_CH = [5]
@@ -107,9 +107,9 @@ SHOOTER_MAX_ANGLE = 25.0
 # during a spin-up transient.
 #
 # Simulated without this clamp, a target at the legal ceiling overshot to
-# ~3330 RPM (13.3 m/s) on the way up. The firing gate would not have fired
-# there, but the flywheel physically reaches that speed, and anything already
-# touching it goes out illegally.
+# ~3330 RPM (13.3 m/s) on the way up. The feeder would not have run there (it
+# waits for at-speed), but the flywheel physically reaches that speed, and
+# anything already touching it goes out illegally.
 #
 # If the shooter cannot reach its target on the field, the honest fix is to
 # re-measure LAUNCH_EFFICIENCY - NOT to raise this.
@@ -142,10 +142,12 @@ CONTROL_INTERVAL = 0.05       # 20 Hz shooter control
 # estimated angle and lets the PID trim from there.
 USE_FEEDFORWARD = True
 
-# "At speed" gate for firing.
+# "At speed" window. The feeder only runs while measured RPM is within
+# AT_SPEED_TOLERANCE of target for AT_SPEED_SAMPLES consecutive control ticks.
+# This is the whole "only feed once the PID reaches target" rule: below the
+# window the feeder is off, so no ball is ever fed into a slow flywheel.
 AT_SPEED_TOLERANCE = 75.0     # RPM
 AT_SPEED_SAMPLES = 3          # consecutive samples inside tolerance
-SPINUP_TIMEOUT = 6.0          # give up and fire anyway? No - abort. See fire().
 
 # RPM measurement. Timing between pulses rather than counting per window:
 # at 3000 RPM channel A only produces ~350 edges/s, so a fixed 50 ms window
@@ -155,20 +157,21 @@ RPM_WINDOW_PULSES = 20
 RPM_STALE_S = 0.25            # no pulses for this long means stopped
 
 # ==========================================================================
-# GATE / INTAKE
+# FEEDER / INTAKE   (both are CONTINUOUS-ROTATION servos, driven by .speed())
 # ==========================================================================
 
-GATE_OPEN = 0
-GATE_CLOSED = 100             # NOTE shooter.py used 55 here. Confirm.
-GATE_OPEN_TIME = 0.217        # chassis_2.py value. chassis_1.py used 0.17.
-GATE_RECOVER_TIME = 0.35      # gate closed again before the next shot
+# The feeder is a continuous servo, not a positional gate. It runs to push
+# balls into the flywheel and stops otherwise - it is never commanded to an
+# "open"/"closed" position. It only ever runs while the shooter is at speed.
+#
+# .speed() takes the same range as the intake. STOP is the trim point where a
+# continuous servo actually holds still - confirm it on the bench, it may not
+# be 0. If the feeder runs the wrong way, negate FEEDER_RUN.
+FEEDER_RUN = 60
+FEEDER_STOP = 5
 
 INTAKE_SPEED = 30
 INTAKE_STOP = 5
-
-# Fire one ball per switch actuation (must return the switch to centre and
-# back). Set True to feed continuously while the switch is held.
-RAPID_FIRE = False
 
 # ==========================================================================
 # CHASSIS
@@ -208,7 +211,7 @@ if not pi.connected:
 left_motors = [Servo(ch) for ch in LEFT_DRIVE_CH]
 right_motors = [Servo(ch) for ch in RIGHT_DRIVE_CH]
 shooter_motors = [Servo(ch) for ch in SHOOTER_CH]
-gate = Servo(GATE_CH)
+feeder_motor = Servo(FEEDER_CH)
 intake_motor = Servo(INTAKE_CH)
 
 running = threading.Event()
@@ -235,7 +238,6 @@ trim = 0.0
 integral_error = 0.0
 previous_error = 0.0
 at_speed_count = 0
-firing = threading.Event()
 
 
 def clamp(value, low, high):
@@ -405,57 +407,42 @@ def at_speed():
 
 
 # ==========================================================================
-# FIRE SEQUENCE
+# SHOOTER / FEEDER / INTAKE  -  called every main-loop tick
 # ==========================================================================
 
-def fire_sequence():
-    """Spin up, wait for the PID to reach speed, then pulse the gate.
+def update_manipulators():
+    """Decide what the shooter, feeder and intake should do this tick.
 
-    Unlike chassis_1/2.py this does not use a fixed spin-up sleep. Waiting on
-    measured RPM is the entire reason for closing the loop: a fixed 2 s sleep
-    either wastes time or fires a slow ball depending on battery charge.
+    Switch positions are mutually exclusive (one 3-position switch), so exactly
+    one of shooter / intake is ever active. The shooter flywheel is spun by the
+    background PID thread; here we only set its TARGET and gate the feeder.
+
+    The feeder (a continuous servo) runs ONLY while the flywheel is measured to
+    be at speed. That single rule is what "only feed once the PID reaches target
+    RPM" means in code: during spin-up, and during the RPM sag right after a
+    ball loads the flywheel, the feeder is off, so no ball is ever pushed into a
+    slow wheel and thrown short.
     """
     global target_rpm
 
-    firing.set()
-    try:
+    # Lost RC (rule 5.9 spirit): everything the shooter touches goes safe.
+    if not rc_is_live():
+        target_rpm = 0.0
+        feeder_motor.speed(FEEDER_STOP)
+        intake_motor.speed(INTAKE_STOP)
+        return
+
+    if shooter_is_triggered():
         target_rpm = slider_to_rpm()
-        print(f"\n[SHOOTER] Spinning up to {target_rpm:.0f} RPM "
-              f"({muzzle_speed(target_rpm):.1f} m/s)")
-
-        deadline = time.perf_counter() + SPINUP_TIMEOUT
-        while running.is_set() and not at_speed():
-            if time.perf_counter() > deadline:
-                print(f"[SHOOTER] ABORT: only reached {measured_rpm:.0f} RPM "
-                      f"in {SPINUP_TIMEOUT:.0f}s. Not firing.")
-                target_rpm = 0.0
-                return
-            sleep(0.01)
-
-        while running.is_set():
-            print(f"[SHOOTER] At {measured_rpm:.0f} RPM "
-                  f"({muzzle_speed(measured_rpm):.1f} m/s) - FIRE")
-            gate.angle(GATE_OPEN)
-            sleep(GATE_OPEN_TIME)
-            gate.angle(GATE_CLOSED)
-            sleep(GATE_RECOVER_TIME)
-
-            if not RAPID_FIRE or not shooter_is_triggered():
-                break
-            # Rapid fire: wait for the flywheel to recover before the next ball.
-            while running.is_set() and not at_speed():
-                sleep(0.01)
-
-        target_rpm = 0.0
-        print("[SHOOTER] Spinning down\n")
-
-    finally:
-        gate.angle(GATE_CLOSED)
-        target_rpm = 0.0
-        # Wait for the switch to return to centre so one actuation is one shot.
-        while shooter_is_triggered() and running.is_set():
-            sleep(0.05)
-        firing.clear()
+        intake_motor.speed(INTAKE_STOP)          # never intake while shooting
+        feeder_motor.speed(FEEDER_RUN if at_speed() else FEEDER_STOP)
+    else:
+        target_rpm = 0.0                         # spin the flywheel down
+        feeder_motor.speed(FEEDER_STOP)
+        if intake_is_triggered():
+            intake_motor.speed(INTAKE_SPEED)
+        else:
+            intake_motor.speed(INTAKE_STOP)
 
 
 def shooter_is_triggered():
@@ -536,7 +523,7 @@ def update_chassis():
 def all_neutral():
     write_drive(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
     write_shooter(SHOOTER_STOP_ANGLE)
-    gate.angle(GATE_CLOSED)
+    feeder_motor.speed(FEEDER_STOP)
     intake_motor.speed(INTAKE_STOP)
 
 
@@ -564,7 +551,7 @@ def main():
     print(f"Slider band    : {SLIDER_MIN_RPM:.0f} - {SLIDER_MAX_RPM:.0f} RPM")
     print(f"Legal ceiling  : {MAX_LEGAL_RPM:.0f} RPM "
           f"= {MAX_LEGAL_LAUNCH_MPS:.1f} m/s (rule 5.5)")
-    print(f"Rapid fire     : {RAPID_FIRE}")
+    print("Feeder         : continuous servo, runs only when flywheel at speed")
     print("=============================================")
 
     shooter_thread = threading.Thread(target=shooter_control_loop, daemon=True)
@@ -573,25 +560,15 @@ def main():
     try:
         while running.is_set():
             update_chassis()
-
-            # Intake is commanded explicitly on every branch. Leaving it
-            # uncommanded during a shot would hold whatever it was last set to.
-            if firing.is_set():
-                intake_motor.speed(INTAKE_STOP)
-            elif shooter_is_triggered():
-                intake_motor.speed(INTAKE_STOP)
-                threading.Thread(target=fire_sequence, daemon=True).start()
-            elif intake_is_triggered() and rc_is_live():
-                intake_motor.speed(INTAKE_SPEED)
-            else:
-                intake_motor.speed(INTAKE_STOP)
+            update_manipulators()
 
             live = "RC OK " if rc_is_live() else "RC LOST"
+            feed = "FEED" if (shooter_is_triggered() and at_speed()) else "----"
             sys.stdout.write(
                 f"\r{live} | RPM {measured_rpm:6.0f}/{target_rpm:6.0f}"
                 f" | {muzzle_speed(measured_rpm):5.2f} m/s"
                 f" | angle {shooter_angle:5.2f} | trim {trim:+5.2f}"
-                f" | slider {slider_to_rpm():4.0f}   ")
+                f" | {feed} | slider {slider_to_rpm():4.0f}   ")
             sys.stdout.flush()
 
             sleep(0.02)
