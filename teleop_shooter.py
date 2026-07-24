@@ -26,6 +26,32 @@
 #     0-1; auto_chassis.py drives 4 motors with the shooter on 6-7. Set
 #     CHASSIS_LAYOUT below to whichever robot you are taking to the field.
 # ==========================================================================
+#
+# ==========================================================================
+#  FIELD TUNING - in priority order. Most of these are ONE measurement each.
+#
+#  A. Directions (bench, wheels/flywheel clear). Each is a single sign flip:
+#       - drive:   wrong way -> swap that side's leads, or the sign in
+#                  write_drive(). Right motor is already inverted (matches
+#                  chassis_2/auto_chassis).
+#       - shooter: flywheel spins backward -> flip SHOOTER_FULL_ANGLE sign.
+#       - 2nd flywheel motor backward -> SECOND_SHOOTER_REVERSED = True.
+#       - feeder:  feeds away from flywheel -> negate FEEDER_RUN.
+#       - intake:  spits instead of collects -> negate INTAKE_SPEED.
+#
+#  B. Continuous-servo stop points. FEEDER_STOP / INTAKE_STOP are where the
+#     servo actually holds still. If it creeps at "stop", nudge the value.
+#
+#  C. THE shooter tune: MOTOR_FREE_RPM. This sets the feedforward slope and
+#     is the only shooter number that really matters. Command a couple of
+#     efforts, read the settled RPM off the console, and set MOTOR_FREE_RPM so
+#     effort * MOTOR_FREE_RPM == the RPM you saw. Do this and the PID barely
+#     works. The PID gains (KP/KI/KD) are pre-ballparked; leave them unless
+#     spin-up oscillates (lower KP) or never quite arrives (raise KI).
+#
+#  D. Only after C: raise SLIDER_MAX_RPM from 0.95*legal toward the ceiling if
+#     you want the last bit of range. Never above MAX_LEGAL_RPM.
+# ==========================================================================
 
 import math
 import sys
@@ -88,59 +114,63 @@ MAX_LEGAL_RPM = (MAX_LEGAL_LAUNCH_MPS /
                  (FLYWHEEL_RADIUS_M * LAUNCH_EFFICIENCY)) * 60.0 / (2.0 * math.pi)
 
 # Slider maps across this band. Low end is a soft practice shot, high end is
-# the legal ceiling. Never raise SLIDER_MAX_RPM above MAX_LEGAL_RPM.
+# just under the legal ceiling. The 5% margin absorbs spin-up overshoot so a
+# near-max target cannot transiently launch over 12 m/s before the flywheel
+# settles. Once MOTOR_FREE_RPM is calibrated you can raise this toward
+# MAX_LEGAL_RPM; never above it.
 SLIDER_MIN_RPM = 1200.0
-SLIDER_MAX_RPM = MAX_LEGAL_RPM
+SLIDER_MAX_RPM = 0.95 * MAX_LEGAL_RPM
 
-# ESC angles for the shooter.
-# CONFLICT TO RESOLVE ON THE BENCH: encoderPIDRPM-2motor.py used positive
-# 6..25 for this direction, chassis_1/2.py used NEGATIVE (-20) for full speed
-# with 5 as stop. Whichever is right depends on ESC wiring. These follow the
-# PID script because that is the one that actually closed the loop.
-SHOOTER_STOP_ANGLE = 5.0
-SHOOTER_MIN_ANGLE = 6.0
-SHOOTER_MAX_ANGLE = 25.0
-
-# Angle that corresponds to the legal RPM ceiling, assuming angle maps roughly
-# linearly to free speed. The control loop clamps to THIS, not to
-# SHOOTER_MAX_ANGLE, so the loop can never command an illegal speed even
-# during a spin-up transient.
+# ---- Shooter ESC angle mapping -------------------------------------------
+# DIRECTION: the shooter runs at NEGATIVE angle for its shooting direction,
+# matching the three files that have actually run on this robot -
+# chassis_1.py, chassis_2.py (SHOOTER_MAX_SPEED = -20) and shooter.py
+# (SHOOTER_FULL = -10). The bench PID script used positive; we follow the
+# robot-tested sign.
 #
-# Simulated without this clamp, a target at the legal ceiling overshot to
-# ~3330 RPM (13.3 m/s) on the way up. The feeder would not have run there (it
-# waits for at-speed), but the flywheel physically reaches that speed, and
-# anything already touching it goes out illegally.
-#
-# If the shooter cannot reach its target on the field, the honest fix is to
-# re-measure LAUNCH_EFFICIENCY - NOT to raise this.
-SHOOTER_LEGAL_MAX_ANGLE = SHOOTER_MIN_ANGLE + min(
-    1.0, MAX_LEGAL_RPM / MOTOR_FREE_RPM) * (SHOOTER_MAX_ANGLE - SHOOTER_MIN_ANGLE)
+# Everything in the control loop works in "effort": 0.0 = stopped,
+# 1.0 = motor free speed. Effort maps to an ESC angle only at the final write,
+# so to REVERSE the shooter you flip ONE constant (SHOOTER_FULL_ANGLE) and
+# nothing else in the loop changes.
+SHOOTER_STOP_ANGLE = 5.0       # ESC neutral / no spin (same 5 the drive ESCs use)
+SHOOTER_FULL_ANGLE = -20.0     # angle at full effort. Flip sign if it spins backward.
 
-# If measured RPM ever exceeds the legal ceiling anyway - wrong efficiency
-# assumption, nonlinear ESC, tailwind on the encoder - cut the trim hard
-# rather than waiting for the PID to walk it back.
-OVERSPEED_CUTBACK = 1.0       # angle units removed per control tick
+# Effort ceiling from rule 5.5. Clamping effort keeps STEADY-STATE speed legal
+# as long as MOTOR_FREE_RPM is calibrated. The measured-RPM backstop in the
+# loop covers the case where it is not.
+EFFORT_LEGAL_MAX = min(1.0, MAX_LEGAL_RPM / MOTOR_FREE_RPM)
 
-# chassis_1/2.py send the SAME angle to both shooter motors, so the ESCs or
-# the mounting must already mirror one of them. encoderPIDRPM-2motor.py
-# instead had SECOND_MOTOR_REVERSED = True. Following the chassis files here
-# because that is the code that has actually run on the robot.
+# chassis_1/2.py send the SAME angle to both shooter motors, so leave this
+# False. If the second flywheel motor spins the wrong way, set True - it then
+# mirrors the command about the ESC neutral. Verify on the bench.
 SECOND_SHOOTER_REVERSED = False
 
-# PID gains, from encoderPIDRPM-2motor.py.
-KP = 0.3
-KI = 0.0005
-KD = 0.5
-ERROR_DEADBAND = 10.0         # RPM
-MAX_TRIM_CHANGE = 0.1         # max angle trim change per control tick
-MAX_TRIM = 8.0                # how far PID may pull away from feedforward
+# ---- Shooter PID  (gains are in EFFORT per RPM) ---------------------------
+# Feedforward does the bulk of the work: effort_ff = target / MOTOR_FREE_RPM
+# jumps straight to the ballpark angle, and the PID only trims the residual, so
+# these gains are deliberately small. Ballparked in simulation (feedforward +
+# position-form PID, plant time-constant swept 0.25-1.0 s): reaches +/-75 RPM
+# in ~1-2 s with the worst-case spin-up peak staying within ~0.6 m/s of legal
+# even before calibration.
+#
+# THE ONE KNOB THAT MATTERS ON THE FIELD IS MOTOR_FREE_RPM, not these gains.
+# It sets the feedforward slope. Procedure: command a few known angles, read
+# the settled RPM, and set MOTOR_FREE_RPM so effort*MOTOR_FREE_RPM matches. Get
+# that right and the PID barely has to do anything. See the tuning note at the
+# top of the file.
+KP = 0.0008
+KI = 0.0006
+KD = 0.00003                  # tiny; set 0 if the RPM readout is jittery
+ERROR_DEADBAND = 10.0         # RPM, ignore noise smaller than this
+INTEGRAL_EFFORT_LIMIT = EFFORT_LEGAL_MAX   # anti-windup clamp on the I term
+
+# Backstop on MEASURED rpm, independent of the effort model. If the real motor
+# is stronger than MOTOR_FREE_RPM assumes, this is what keeps launches legal
+# until you recalibrate. Simulated to hold the worst-case transient near 12.6
+# m/s even with a 20% model error.
+OVERSPEED_CUTBACK = 0.04      # effort removed per tick while over the limit
 
 CONTROL_INTERVAL = 0.05       # 20 Hz shooter control
-
-# Feedforward. Without it the trim rate above needs ~19 s to cross the angle
-# range, so spin-up would be unusably slow. Feedforward jumps straight to the
-# estimated angle and lets the PID trim from there.
-USE_FEEDFORWARD = True
 
 # "At speed" window. The feeder only runs while measured RPM is within
 # AT_SPEED_TOLERANCE of target for AT_SPEED_SAMPLES consecutive control ticks.
@@ -234,7 +264,7 @@ _pulse_lock = threading.Lock()
 target_rpm = 0.0
 measured_rpm = 0.0
 shooter_angle = SHOOTER_STOP_ANGLE
-trim = 0.0
+shooter_effort = 0.0
 integral_error = 0.0
 previous_error = 0.0
 at_speed_count = 0
@@ -334,24 +364,36 @@ def slider_to_rpm():
     return min(rpm, MAX_LEGAL_RPM)
 
 
-def feedforward_angle(rpm):
-    if not USE_FEEDFORWARD or rpm <= 0:
-        return SHOOTER_MIN_ANGLE
-    proportion = clamp(rpm / MOTOR_FREE_RPM, 0.0, 1.0)
-    return SHOOTER_MIN_ANGLE + proportion * (SHOOTER_MAX_ANGLE - SHOOTER_MIN_ANGLE)
+def effort_to_angle(effort):
+    """Map effort (0..1 of free speed) to an ESC angle, clamped to legal."""
+    effort = clamp(effort, 0.0, EFFORT_LEGAL_MAX)
+    return SHOOTER_STOP_ANGLE + effort * (SHOOTER_FULL_ANGLE - SHOOTER_STOP_ANGLE)
 
 
-def write_shooter(angle):
+def write_shooter(effort):
+    """Command both flywheel motors from an effort value. Returns the angle."""
+    angle = effort_to_angle(effort)
     shooter_motors[0].angle(angle)
     if len(shooter_motors) > 1:
-        second = -angle if SECOND_SHOOTER_REVERSED else angle
+        # Mirror the second motor about the ESC neutral, not about zero, since
+        # neutral is offset (5, not 0).
+        second = (2 * SHOOTER_STOP_ANGLE - angle) if SECOND_SHOOTER_REVERSED else angle
         shooter_motors[1].angle(second)
+    return angle
 
 
 def shooter_control_loop():
-    """Closed-loop flywheel speed. Runs in its own thread at CONTROL_INTERVAL."""
-    global measured_rpm, shooter_angle, trim
+    """Closed-loop flywheel speed. Runs in its own thread at CONTROL_INTERVAL.
+
+    Control law: feedforward (effort = target / free speed) plus a position-form
+    PID that only trims the residual. Everything is in effort units; the legal
+    ceiling is enforced twice - as an effort clamp (good if free speed is
+    calibrated) and as a hard cutback on measured RPM (good even if it is not).
+    """
+    global measured_rpm, shooter_angle, shooter_effort
     global integral_error, previous_error, at_speed_count
+
+    i_limit = INTEGRAL_EFFORT_LIMIT / max(KI, 1e-9)
 
     while running.is_set():
         loop_start = time.perf_counter()
@@ -359,39 +401,32 @@ def shooter_control_loop():
 
         if target_rpm <= 0:
             # Coast down. Reset the PID so the next spin-up starts clean.
-            trim = 0.0
             integral_error = 0.0
             previous_error = 0.0
             at_speed_count = 0
-            shooter_angle = SHOOTER_STOP_ANGLE
-            write_shooter(SHOOTER_STOP_ANGLE)
+            shooter_effort = 0.0
+            shooter_angle = write_shooter(0.0)
         else:
             error = target_rpm - measured_rpm
             if abs(error) < ERROR_DEADBAND:
                 error = 0.0
 
-            integral_error += error * CONTROL_INTERVAL
-            # Anti-windup: the trim is clamped, so let the integral wind no
-            # further than the trim can actually express.
-            integral_error = clamp(integral_error, -MAX_TRIM / max(KI, 1e-9),
-                                   MAX_TRIM / max(KI, 1e-9))
-
-            derivative = error - previous_error
+            integral_error = clamp(integral_error + error * CONTROL_INTERVAL,
+                                   -i_limit, i_limit)
+            derivative = (error - previous_error) / CONTROL_INTERVAL
             previous_error = error
 
-            output = (KP * error) + (KI * integral_error) + (KD * derivative)
-            trim = clamp(trim + clamp(output, -MAX_TRIM_CHANGE, MAX_TRIM_CHANGE),
-                         -MAX_TRIM, MAX_TRIM)
+            effort_ff = target_rpm / MOTOR_FREE_RPM
+            correction = (KP * error) + (KI * integral_error) + (KD * derivative)
+            effort = clamp(effort_ff + correction, 0.0, EFFORT_LEGAL_MAX)
 
-            # Overspeed guard on MEASURED speed. Independent of the angle model
-            # above, so it still holds if the linear assumption is wrong.
+            # Hard backstop on MEASURED speed, independent of the effort model.
             if measured_rpm > MAX_LEGAL_RPM:
-                trim -= OVERSPEED_CUTBACK
+                effort = max(0.0, effort - OVERSPEED_CUTBACK)
                 integral_error = 0.0
 
-            shooter_angle = clamp(feedforward_angle(target_rpm) + trim,
-                                  SHOOTER_MIN_ANGLE, SHOOTER_LEGAL_MAX_ANGLE)
-            write_shooter(shooter_angle)
+            shooter_effort = effort
+            shooter_angle = write_shooter(effort)
 
             if abs(target_rpm - measured_rpm) <= AT_SPEED_TOLERANCE:
                 at_speed_count += 1
@@ -567,7 +602,7 @@ def main():
             sys.stdout.write(
                 f"\r{live} | RPM {measured_rpm:6.0f}/{target_rpm:6.0f}"
                 f" | {muzzle_speed(measured_rpm):5.2f} m/s"
-                f" | angle {shooter_angle:5.2f} | trim {trim:+5.2f}"
+                f" | angle {shooter_angle:6.2f} | eff {shooter_effort:4.2f}"
                 f" | {feed} | slider {slider_to_rpm():4.0f}   ")
             sys.stdout.flush()
 
