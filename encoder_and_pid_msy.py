@@ -102,10 +102,43 @@ MAX_LEGAL_RPM = (12.0 / FLYWHEEL_RADIUS_M) * 60.0 / (2.0 * math.pi)
 # integral wind up to full throttle against a dead encoder.
 STALL_SECONDS = 3.0
 
-# Roughly how much RPM one throttle unit buys, at the top of the range.
-# Only used for the runaway guard below, so it does not need to be exact.
-MOTOR_FREE_RPM = 6000.0
-RPM_PER_THROTTLE = MOTOR_FREE_RPM / MAX_THROTTLE
+# Every control tick is written here so an oscillation can be plotted rather
+# than guessed at. Overwritten on each run - copy it off before restarting.
+LOG_PATH = "rpm_log.csv"
+
+# MEASURED PLANT, fitted from throttle/RPM pairs logged on the bench:
+#
+#     rpm = 340 * throttle - 1544
+#
+# Two things fall out of that, and both were wrong in earlier versions:
+#   - one throttle unit is worth 340 RPM, not the 240 implied by dividing free
+#     speed by max throttle
+#   - the ESC produces NOTHING until about throttle 4.5. Everything below that
+#     is dead travel.
+#
+# RE-MEASURE THESE if the battery, ESC, wheel or belt changes. Command a few
+# fixed speeds, note the settled throttle, and fit a straight line.
+RPM_PER_THROTTLE = 340.0
+THROTTLE_DEADBAND = 4.54        # throttle at which the wheel first turns
+
+
+def feedforward_throttle(target):
+    """The throttle that should, on its own, produce the requested speed.
+
+    Without this the controller has to discover the operating point from zero
+    every single time, walking the throttle up by KP*error per tick. That is
+    slow, and it means the integral term is doing all the work at steady state
+    rather than just trimming.
+    """
+    if target <= 0:
+        return 0.0
+    return THROTTLE_DEADBAND + target / RPM_PER_THROTTLE
+
+
+# How far the PID may pull away from the feedforward estimate. Wide enough to
+# cover a sagging battery and a loaded wheel, tight enough that a bad estimate
+# cannot run away.
+MAX_TRIM = 4.0
 
 # RUNAWAY GUARD.
 #
@@ -122,6 +155,7 @@ RPM_PER_THROTTLE = MOTOR_FREE_RPM / MAX_THROTTLE
 THROTTLE_HEADROOM = 1.6
 
 throttle = 0.0          # Current throttle magnitude, 0 = stopped.
+trim = 0.0              # PID correction on top of the feedforward estimate.
 integral_error = 0.0    # Accumulated error for the integral term.
 previous_error = 0.0    # Previous error for the derivative term.
 
@@ -334,7 +368,7 @@ def main_loop():
     """Main loop: read the encoder, estimate RPM, and adjust the motor throttle."""
     global rpm, rotations, sample_rotations, sample_pulses
     global last_control_time
-    global throttle, integral_error, previous_error, target_rpm
+    global throttle, trim, integral_error, previous_error, target_rpm
 
     print("Reading encoder... Press Ctrl+C to stop.")
     print(f"Motor is STOPPED until you type a target. Legal max "
@@ -350,6 +384,10 @@ def main_loop():
     # The encoder gets its own thread so the print and sleep below cannot
     # starve it. See encoder_thread() for why that matters.
     threading.Thread(target=encoder_thread, daemon=True).start()
+
+    log_file = open(LOG_PATH, "w", buffering=1)
+    log_file.write("t,target,rpm,throttle,trim,kp,kd,db\n")
+    log_start = time.monotonic()
 
     last_motion = time.monotonic()
     last_print_time = time.monotonic()
@@ -372,6 +410,7 @@ def main_loop():
                 # Commanded stop: zero everything so the next spin-up starts
                 # clean and the integral cannot carry over.
                 throttle = 0.0
+                trim = 0.0
                 integral_error = 0.0
                 previous_error = 0.0
                 last_motion = now
@@ -387,17 +426,30 @@ def main_loop():
                                   + (KD * derivative_error))
                 angle_change = clamp(control_output,
                                      -MAX_ANGLE_CHANGE, MAX_ANGLE_CHANGE)
+
+                # Feedforward carries the operating point; the PID only trims
+                # around it. Previously the PID had to walk the throttle up
+                # from zero itself, which is slow and leaves the integral
+                # holding the whole load at steady state.
+                trim = clamp(trim + angle_change, -MAX_TRIM, MAX_TRIM)
+
                 # Never command more throttle than the requested speed could
                 # plausibly need. Without this, an under-reporting encoder
                 # drives the flywheel away while the screen looks calm.
+                # Headroom applies only to the part ABOVE the ESC's dead
+                # travel - scaling the deadband itself would just inflate the
+                # ceiling for no reason.
                 throttle_ceiling = min(
                     MAX_THROTTLE,
-                    (target_rpm / RPM_PER_THROTTLE) * THROTTLE_HEADROOM + 1.0,
+                    THROTTLE_DEADBAND
+                    + (target_rpm / RPM_PER_THROTTLE) * THROTTLE_HEADROOM,
                     # And never past the throttle the LEGAL ceiling should need,
                     # plus a little for battery sag. This is the only thing
                     # standing between a lying encoder and an illegal shot.
-                    (MAX_LEGAL_RPM / RPM_PER_THROTTLE) * 1.25)
-                throttle = clamp(throttle + angle_change, 0.0, throttle_ceiling)
+                    THROTTLE_DEADBAND
+                    + (MAX_LEGAL_RPM / RPM_PER_THROTTLE) * 1.25)
+                throttle = clamp(feedforward_throttle(target_rpm) + trim,
+                                 0.0, throttle_ceiling)
 
                 if throttle >= throttle_ceiling - 1e-9 and rpm < target_rpm * 0.7:
                     print(f"\n  !! throttle is capped at {throttle_ceiling:.1f} "
@@ -421,6 +473,14 @@ def main_loop():
                 previous_error = error
 
             last_control_time = now
+
+            # Log every control tick, not every print. The 5 Hz status line is
+            # far too slow to show the shape of an oscillation - this is what
+            # you plot afterwards to see its period and amplitude.
+            if log_file is not None:
+                log_file.write(f"{now - log_start:.3f},{target_rpm:.1f},"
+                               f"{rpm:.1f},{throttle:.3f},{trim:+.3f},"
+                               f"{KP:g},{KD:g},{ERROR_DEADBAND:g}\n")
 
         handle_keyboard()
 
