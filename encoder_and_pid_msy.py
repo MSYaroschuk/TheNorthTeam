@@ -192,8 +192,13 @@ TUNABLES = ("kp", "kd", "ramp", "db")
 def mark_shot(text):
     """Tag the log at the instant a ball is fired.
 
-    's' alone marks the shot; 's 8.5' also records where it landed, which is
-    what lets RPM-at-fire be correlated against actual distance.
+    's'              mark only
+    's 8.5'          landed 8.5 m out
+    's 8.5 -0.4'     8.5 m out, 0.4 m left of the aim line
+
+    Lateral offset is worth recording because flywheel speed cannot cause
+    left-right error - it only changes distance. So sideways scatter measures
+    the mechanical noise floor directly.
     """
     global pending_event
     pending_event = "shot" if not text else f"shot:{text}"
@@ -291,8 +296,8 @@ def main_loop():
     log_path = time.strftime("shots_%H%M%S.csv")
     log = open(log_path, "w", buffering=1)
     log.write("t,target,rpm,mps,throttle,trim,event\n")
-    print(f"Logging to {log_path}. Type 's' when you fire, or 's 8.5' to also "
-          f"record where it landed.")
+    print(f"Logging to {log_path}. On each shot type 's <distance> <lateral>', "
+          f"e.g. 's 8.5 -0.4'.")
 
     threading.Thread(target=encoder_thread, daemon=True).start()
     threading.Thread(target=read_commands, daemon=True).start()
