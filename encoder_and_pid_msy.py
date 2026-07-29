@@ -79,6 +79,14 @@ FLYWHEEL_DIAMETER_IN = 3.0
 FLYWHEEL_RADIUS_M = FLYWHEEL_DIAMETER_IN * 0.0254 / 2.0
 MAX_LEGAL_RPM = (12.0 / FLYWHEEL_RADIUS_M) * 60.0 / (2.0 * math.pi)  # rule 5.5
 
+# BENCH TESTING - targets are capped here, not at MAX_LEGAL_RPM. Rule 5.5 caps
+# competition launches at 12.0 m/s; anything above MAX_LEGAL_RPM is bench only
+# and the status line marks it. SET THIS BACK TO MAX_LEGAL_RPM BEFORE THE MATCH.
+#
+# Still bounded rather than open: this value is also what stops a failing
+# encoder from driving the wheel to free speed.
+MAX_TARGET_RPM = 6000.0
+
 STALL_SECONDS = 3.0          # commanded but not turning -> cut power
 
 # A failing encoder reads slow, so the controller adds throttle and the wheel
@@ -237,10 +245,13 @@ def handle_commands():
             print(f"\n  '{line}' not understood - number, 'kd 0.02', or '?'")
             continue
 
-        if requested > MAX_LEGAL_RPM:
-            print(f"\n  capping {requested:.0f} -> {MAX_LEGAL_RPM:.0f} RPM "
-                  f"(12.0 m/s, rule 5.5)")
-            requested = MAX_LEGAL_RPM
+        if requested > MAX_TARGET_RPM:
+            print(f"\n  capping {requested:.0f} -> {MAX_TARGET_RPM:.0f} RPM")
+            requested = MAX_TARGET_RPM
+        elif requested > MAX_LEGAL_RPM:
+            print(f"\n  note: {requested:.0f} RPM is "
+                  f"{muzzle_mps(requested):.1f} m/s, above the 12.0 m/s "
+                  f"competition limit. Bench only.")
         target_rpm = max(0.0, requested)
 
 
@@ -251,8 +262,9 @@ def handle_commands():
 def main_loop():
     global rpm, throttle, trim, previous_error, target_rpm
 
-    print(f"Motor STOPPED until you type a target. Legal max "
-          f"{MAX_LEGAL_RPM:.0f} RPM.")
+    print(f"Motor STOPPED until you type a target. Max {MAX_TARGET_RPM:.0f} RPM.")
+    print(f"BENCH MODE - competition limit is {MAX_LEGAL_RPM:.0f} RPM "
+          f"(12.0 m/s); above that the line shows OVER.")
     print("Commands: <rpm> | 0 | kp 0.003 | kd 0.02 | ramp 0.8 | db 20 | ? | q")
 
     threading.Thread(target=encoder_thread, daemon=True).start()
@@ -288,7 +300,7 @@ def main_loop():
                     THROTTLE_DEADBAND
                     + (target_rpm / RPM_PER_THROTTLE) * THROTTLE_HEADROOM,
                     THROTTLE_DEADBAND
-                    + (MAX_LEGAL_RPM / RPM_PER_THROTTLE) * 1.25)
+                    + (MAX_TARGET_RPM / RPM_PER_THROTTLE) * 1.25)
                 throttle = clamp(feedforward_throttle(target_rpm) + trim,
                                  0.0, ceiling)
 
@@ -311,9 +323,10 @@ def main_loop():
             if elapsed > 0:
                 poll_hz = (poll_count - last_poll_count) / elapsed
             last_poll_count, last_poll_time, last_print = poll_count, now, now
+            flag = "OVER" if rpm > MAX_LEGAL_RPM else "    "
             sys.stdout.write(
                 f"\rpulses {pulse_count:7d} | RPM {rpm:6.0f} / {target_rpm:<6.0f}"
-                f" | {muzzle_mps(rpm):5.2f} m/s | throttle {throttle:5.2f}"
+                f" | {muzzle_mps(rpm):5.2f} m/s {flag} | throttle {throttle:5.2f}"
                 f" | trim {trim:+5.2f} | poll {poll_hz / 1000:4.1f}kHz   ")
             sys.stdout.flush()
 
