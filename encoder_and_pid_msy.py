@@ -2,6 +2,7 @@ import sys
 import threading
 import time
 import math
+from collections import deque
 from queue import Queue
 from fusion_hat.servo import Servo
 from fusion_hat.pin import Pin
@@ -30,8 +31,11 @@ NEUTRAL_ANGLE = 5.0     # ESC stop. VERIFY: at this value the motor must not tur
 DIRECTION = -1          # -1 drives negative, matching the chassis scripts
 MAX_THROTTLE = 25.0     # full throttle magnitude away from neutral
 
-# How often to estimate RPM from the encoder samples.
-SAMPLE_INTERVAL_SECONDS = 0.2
+# Speed is measured by timing this many pulses, not by counting pulses in a
+# fixed window - see read_rpm(). More pulses is smoother but laggier; 20 spans
+# about 38 ms at 2000 RPM, which is comfortably inside the control interval.
+RPM_WINDOW_PULSES = 20
+RPM_STALE_SECONDS = 0.3   # no pulses for this long means the wheel has stopped
 
 # How often to update the motor control output.
 CONTROL_INTERVAL_SECONDS = 0.1
@@ -58,7 +62,6 @@ sample_rotations = 0    # Rotations counted during the current sample window.
 sample_pulses = 0       # Pulse count during the current sample window.
 last_a_state = None     # Previous state of channel A for edge detection.
 last_b_state = None     # Previous state of channel B for edge detection.
-last_sample_time = time.monotonic()   # Time of the last RPM sample.
 last_control_time = time.monotonic()  # Time of the last PID update.
 
 # PID settings. All five are LIVE-TUNABLE while running - type e.g. "kp 0.5"
@@ -76,9 +79,9 @@ last_control_time = time.monotonic()  # Time of the last PID update.
 # value) overshoots by about 1450 RPM once the ramp clamp stops hiding it.
 # The old KP of 0.3 was roughly 2800x too high and only appeared stable because
 # the clamp saturated it into a slew-limited bang-bang controller.
-KP = 0.0010             # integral action  (was 0.3)
+KP = 0.0020             # integral action  (was 0.3)
 KI = 0.0                # MUST stay 0 here (was 0.0005)
-KD = 0.020              # proportional damping  (was 0.5)
+KD = 0.030              # proportional damping  (was 0.5)
 
 # Maximum change to the throttle per control update. This is a rate limit that
 # sits AFTER the PID, so it caps how fast the flywheel can spin up no matter
@@ -152,22 +155,9 @@ def stop_motor():
 stop_motor()
 
 
-def calculate_rpm(pulses, elapsed_seconds):
-    """Convert the counts observed over a time window into RPM.
-
-    Revolutions per SECOND times 60 gives revolutions per MINUTE. This used to
-    multiply by 120, which had no justification and made every reading twice as
-    fast as reality. Together with the old PULSES_PER_REV of 14, the display was
-    over-reporting by a factor of (120/14) / (60/16) = 2.29.
-    """
-    if elapsed_seconds <= 0:
-        return 0.0
-    revolutions = pulses / PULSES_PER_REV
-    return (revolutions / elapsed_seconds) * 60.0
-
-
 encoder_lock = threading.Lock()
 poll_count = 0          # how many times the encoder thread has sampled the pins
+pulse_times = deque(maxlen=RPM_WINDOW_PULSES)   # monotonic time of recent pulses
 
 
 def encoder_thread():
@@ -207,12 +197,46 @@ def encoder_thread():
                 with encoder_lock:
                     pos += 1
                     sample_pulses += 1
+                    pulse_times.append(time.monotonic())
                     if b_state == 1:
                         rotations += 1
                         sample_rotations += 1
 
         last_a_state = a_state
         last_b_state = b_state
+
+
+def read_rpm():
+    """Speed from the TIME SPANNED by the last RPM_WINDOW_PULSES pulses.
+
+    The old method counted whole pulses inside a fixed 0.2 s window. That
+    quantises hard: one pulse is (60 / PULSES_PER_REV) / 0.2 = 18.75 RPM, so at
+    a 2000 RPM target the only readings available were 1981, 2000 and 2019.
+    Nothing downstream can hold tighter than the ruler can measure, and the
+    controller was chasing single-count wobble as if it were real speed change.
+
+    Timing a fixed NUMBER of pulses instead uses the 62 kHz poll clock as the
+    ruler. At 2000 RPM twenty pulses span about 38 ms, which the poll resolves
+    to roughly +-0.9 RPM - about twenty times finer than counting.
+
+    It also updates every control tick rather than every 0.2 s, so the
+    derivative term sees a fresh number each time instead of alternating
+    between a real change and a stale zero.
+    """
+    with encoder_lock:
+        if len(pulse_times) < 2:
+            return 0.0
+        stamps = list(pulse_times)
+
+    # Nothing recently -> stopped. Without this the last computed speed would
+    # persist forever after the wheel halted.
+    if time.monotonic() - stamps[-1] > RPM_STALE_SECONDS:
+        return 0.0
+
+    span = stamps[-1] - stamps[0]
+    if span <= 0:
+        return 0.0
+    return ((len(stamps) - 1) / PULSES_PER_REV) / span * 60.0
 
 
 TUNABLES = ("kp", "ki", "kd", "ramp", "db")
@@ -309,7 +333,7 @@ def handle_keyboard():
 def main_loop():
     """Main loop: read the encoder, estimate RPM, and adjust the motor throttle."""
     global rpm, rotations, sample_rotations, sample_pulses
-    global last_sample_time, last_control_time
+    global last_control_time
     global throttle, integral_error, previous_error, target_rpm
 
     print("Reading encoder... Press Ctrl+C to stop.")
@@ -336,14 +360,8 @@ def main_loop():
     while True:
         now = time.monotonic()
 
-        # Update RPM estimate on a fixed sample interval.
-        if now - last_sample_time >= SAMPLE_INTERVAL_SECONDS:
-            elapsed_seconds = now - last_sample_time
-            with encoder_lock:
-                pulses = sample_pulses
-                sample_pulses = 0
-            rpm = calculate_rpm(pulses, elapsed_seconds)
-            last_sample_time = now
+        # Speed is available continuously now, not once per 0.2 s window.
+        rpm = read_rpm()
 
         if rpm > 5.0:
             last_motion = now
