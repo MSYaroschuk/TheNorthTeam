@@ -111,6 +111,9 @@ throttle = 0.0
 trim = 0.0
 previous_error = 0.0
 input_queue = Queue()
+pending_event = ""           # written into the next log row, then cleared
+
+LOG_RATE_HZ = 50             # fine enough to resolve the dip as a ball passes
 
 
 def clamp(value, low, high):
@@ -186,6 +189,18 @@ def read_rpm():
 TUNABLES = ("kp", "kd", "ramp", "db")
 
 
+def mark_shot(text):
+    """Tag the log at the instant a ball is fired.
+
+    's' alone marks the shot; 's 8.5' also records where it landed, which is
+    what lets RPM-at-fire be correlated against actual distance.
+    """
+    global pending_event
+    pending_event = "shot" if not text else f"shot:{text}"
+    print(f"\n  marked {pending_event} at {rpm:.0f} RPM "
+          f"({muzzle_mps(rpm):.2f} m/s)")
+
+
 def read_commands():
     while True:
         try:
@@ -216,6 +231,10 @@ def handle_commands():
             raise KeyboardInterrupt
 
         parts = line.split()
+
+        if parts[0] == "s":
+            mark_shot(" ".join(parts[1:]))
+            continue
         if len(parts) == 1:
             for key in TUNABLES:                    # accept "kd0.02" too
                 if parts[0].startswith(key) and len(parts[0]) > len(key):
@@ -267,9 +286,19 @@ def main_loop():
           f"(12.0 m/s); above that the line shows OVER.")
     print("Commands: <rpm> | 0 | kp 0.003 | kd 0.02 | ramp 0.8 | db 20 | ? | q")
 
+    global pending_event
+
+    log_path = time.strftime("shots_%H%M%S.csv")
+    log = open(log_path, "w", buffering=1)
+    log.write("t,target,rpm,mps,throttle,trim,event\n")
+    print(f"Logging to {log_path}. Type 's' when you fire, or 's 8.5' to also "
+          f"record where it landed.")
+
     threading.Thread(target=encoder_thread, daemon=True).start()
     threading.Thread(target=read_commands, daemon=True).start()
 
+    log_start = time.monotonic()
+    last_log = 0.0
     last_control = time.monotonic()
     last_motion = time.monotonic()
     last_print = time.monotonic()
@@ -316,6 +345,13 @@ def main_loop():
             last_control = now
 
         handle_commands()
+
+        if now - last_log >= 1.0 / LOG_RATE_HZ or pending_event:
+            log.write(f"{now - log_start:.3f},{target_rpm:.0f},{rpm:.1f},"
+                      f"{muzzle_mps(rpm):.3f},{throttle:.3f},{trim:+.3f},"
+                      f"{pending_event}\n")
+            pending_event = ""
+            last_log = now
 
         # 5 Hz - printing every pass starves the encoder thread.
         if now - last_print >= 0.2:
