@@ -124,8 +124,8 @@ LOG_RATE_HZ = 50             # fine enough to resolve the dip as a ball passes
 # +-16 RPM noise; averaging cuts that scatter to about 6 RPM, so 25 sits well
 # clear of it. Tested against synthetic traces: every ball found, no false
 # positives, and none in two minutes of noise with no shots at all.
-SHOT_DIP_RPM = 25.0
-SHOT_DEBOUNCE_S = 0.8        # ignore further dips this soon after one
+SHOT_DIP_RPM = 25.0          # at 2000 RPM; scaled up with speed, see below
+SHOT_DEBOUNCE_S = 1.5        # a real dip can outlast 0.8 s and re-trigger
 
 recent_rpm = deque(maxlen=30)    # ~0.6 s of history at LOG_RATE_HZ
 last_shot_time = 0.0
@@ -388,7 +388,12 @@ def main_loop():
                 half = len(window) // 2
                 before = sum(window[:half]) / half
                 after = sum(window[half:]) / (len(window) - half)
-                if before - after > SHOT_DIP_RPM:
+                # Measurement noise grows roughly with speed squared (the
+                # pulse window shrinks as RPM rises and each ms of jitter is
+                # worth more RPM), so the threshold must grow with it. A fixed
+                # 25 sat inside the noise at 3400 and detected phantom shots.
+                dip_threshold = SHOT_DIP_RPM * max(1.0, (target_rpm / 2000.0) ** 2)
+                if before - after > dip_threshold:
                     last_shot_time = now
                     last_shot_rpm = before
                     pending_event = f"shot:{before:.0f}:{before - after:.0f}"
