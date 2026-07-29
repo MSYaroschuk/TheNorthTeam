@@ -31,10 +31,29 @@ NEUTRAL_ANGLE = 5.0     # ESC stop. VERIFY: at this value the motor must not tur
 DIRECTION = -1          # -1 drives negative, matching the chassis scripts
 MAX_THROTTLE = 25.0     # full throttle magnitude away from neutral
 
-# Speed is measured by timing this many pulses, not by counting pulses in a
-# fixed window - see read_rpm(). More pulses is smoother but laggier; 20 spans
-# about 38 ms at 2000 RPM, which is comfortably inside the control interval.
-RPM_WINDOW_PULSES = 20
+# Speed is measured by timing this many pulses - see read_rpm().
+#
+# SIZED FROM LOGGED DATA, not guessed. With 20 pulses the readings had a
+# standard deviation of 53 RPM at a 2000 RPM target, and - the giveaway -
+# consecutive readings 104 ms apart were UNCORRELATED (autocorrelation -0.04).
+# A flywheel with an inertia disc cannot change speed randomly between samples;
+# a real one would have shown about +0.9. So that scatter was measurement
+# noise, and the controller was faithfully chasing it, dithering the throttle
+# by 1.8 units (about 600 RPM of command) to correct a wheel that was already
+# steady.
+#
+# The error works out to about 1 ms of timing jitter, which is the encoder
+# thread losing the GIL or being descheduled. The 16 us poll resolution is not
+# the limit; the OS is. Jitter is roughly fixed, so a longer window dilutes it:
+#
+#     pulses   span at 2000 RPM   noise      lag
+#         20               38 ms   53 RPM   19 ms
+#         48               90 ms   22 RPM   45 ms
+#         64              120 ms   16 RPM   60 ms
+#
+# 64 is chosen to get the noise under the +-25 RPM the shot actually needs.
+# The added lag is tens of ms against a plant whose time constant is seconds.
+RPM_WINDOW_PULSES = 64
 RPM_STALE_SECONDS = 0.3   # no pulses for this long means the wheel has stopped
 
 # How often to update the motor control output.
@@ -90,7 +109,10 @@ KD = 0.030              # proportional damping  (was 0.5)
 # not the gains. Raise it with "ramp 0.5".
 MAX_ANGLE_CHANGE = 0.8  # was 0.1, which needed 25 s to cross the throttle range
 
-ERROR_DEADBAND = 15.0   # Ignore small RPM errors to reduce jitter.
+# Ignore errors smaller than this. Should sit just above the measurement noise
+# floor, so the controller does not chase it. With a 64-pulse window that floor
+# is about 16 RPM, hence 20.
+ERROR_DEADBAND = 20.0
 
 # Rule 5.5: tennis balls may not be launched above 12.0 m/s. On a 3 in flywheel
 # that is the RPM below. Typed targets are capped at it.
