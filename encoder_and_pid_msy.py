@@ -99,6 +99,25 @@ MAX_LEGAL_RPM = (12.0 / FLYWHEEL_RADIUS_M) * 60.0 / (2.0 * math.pi)
 # integral wind up to full throttle against a dead encoder.
 STALL_SECONDS = 3.0
 
+# Roughly how much RPM one throttle unit buys, at the top of the range.
+# Only used for the runaway guard below, so it does not need to be exact.
+MOTOR_FREE_RPM = 6000.0
+RPM_PER_THROTTLE = MOTOR_FREE_RPM / MAX_THROTTLE
+
+# RUNAWAY GUARD.
+#
+# If the encoder under-reports - dropped pulses, a loose wire, a failing
+# sensor - the controller sees a wheel that is too slow and keeps adding
+# throttle. The wheel really does accelerate, the screen does not show it, and
+# nothing in the loop notices. The stall guard does not catch this either,
+# because the wheel IS turning.
+#
+# So bound the throttle by what the requested speed could plausibly need. A
+# target of 1700 RPM should need about 1700/240 = 7 throttle units; there is no
+# honest reason to be commanding 20. The 1.6 multiplier leaves room for a low
+# battery and for the wheel to be loaded, while still catching a runaway early.
+THROTTLE_HEADROOM = 1.6
+
 throttle = 0.0          # Current throttle magnitude, 0 = stopped.
 integral_error = 0.0    # Accumulated error for the integral term.
 previous_error = 0.0    # Previous error for the derivative term.
@@ -350,7 +369,24 @@ def main_loop():
                                   + (KD * derivative_error))
                 angle_change = clamp(control_output,
                                      -MAX_ANGLE_CHANGE, MAX_ANGLE_CHANGE)
-                throttle = clamp(throttle + angle_change, 0.0, MAX_THROTTLE)
+                # Never command more throttle than the requested speed could
+                # plausibly need. Without this, an under-reporting encoder
+                # drives the flywheel away while the screen looks calm.
+                throttle_ceiling = min(
+                    MAX_THROTTLE,
+                    (target_rpm / RPM_PER_THROTTLE) * THROTTLE_HEADROOM + 1.0,
+                    # And never past the throttle the LEGAL ceiling should need,
+                    # plus a little for battery sag. This is the only thing
+                    # standing between a lying encoder and an illegal shot.
+                    (MAX_LEGAL_RPM / RPM_PER_THROTTLE) * 1.25)
+                throttle = clamp(throttle + angle_change, 0.0, throttle_ceiling)
+
+                if throttle >= throttle_ceiling - 1e-9 and rpm < target_rpm * 0.7:
+                    print(f"\n  !! throttle is capped at {throttle_ceiling:.1f} "
+                          f"for a {target_rpm:.0f} RPM target, but the encoder "
+                          f"only reads {rpm:.0f}.")
+                    print("     Suspect dropped pulses - check the poll rate. "
+                          "The wheel may be far faster than shown.")
 
                 if now - last_motion > STALL_SECONDS:
                     print(f"\n  !! commanded {target_rpm:.0f} RPM but nothing "
