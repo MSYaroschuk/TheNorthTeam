@@ -36,9 +36,9 @@ SAMPLE_INTERVAL_SECONDS = 0.2
 # How often to update the motor control output.
 CONTROL_INTERVAL_SECONDS = 0.1
 
-# Counts registered by update_encoder() per full revolution of the flywheel.
+# Counts registered by encoder_thread() per full revolution of the flywheel.
 #
-# MEASURED at 16 over one hand-turned revolution. update_encoder() counts twice
+# MEASURED at 16 over one hand-turned revolution. encoder_thread() counts twice
 # per quadrature cycle (once when A rises, once when B changes while A is high),
 # so 16 counts implies 8 cycles = 32 quadrature ticks per revolution.
 #
@@ -147,27 +147,53 @@ def calculate_rpm(pulses, elapsed_seconds):
     return (revolutions / elapsed_seconds) * 60.0
 
 
-def update_encoder():
-    """Read the encoder channels and count a quadrature transition."""
+encoder_lock = threading.Lock()
+poll_count = 0          # how many times the encoder thread has sampled the pins
+
+
+def encoder_thread():
+    """Poll the encoder as fast as possible, on its own thread.
+
+    THIS USED TO LIVE IN THE MAIN LOOP, and that was the cause of the hunting
+    at higher speeds. The main loop also does a stdout write, a flush and a
+    sleep(0.001) every pass, which caps it near 700-900 Hz. To catch every
+    rising edge you have to sample faster than channel A's high time:
+
+        1000 RPM -> 533 Hz needed      (fine)
+        1500 RPM -> 800 Hz needed      (marginal - this is where it broke)
+        2000 RPM -> 1067 Hz needed     (misses pulses)
+
+    Missing pulses makes the measured RPM read LOW, so the PID pushes harder,
+    which raises the speed, which misses MORE pulses. That runs away until the
+    count happens to catch up and the controller slams back. The result looks
+    exactly like a badly tuned loop, but no gain change can fix it.
+
+    On its own thread with nothing else to do, this polls in the tens of kHz.
+    The status line shows the achieved rate - if it ever drops near the numbers
+    above, the readings are not trustworthy.
+    """
     global pos, rotations, sample_rotations, sample_pulses
-    global last_a_state, last_b_state
+    global last_a_state, last_b_state, poll_count
 
-    a_state = pinA.value()
-    b_state = pinB.value()
+    last_a_state = pinA.value()
+    last_b_state = pinB.value()
 
-    if last_a_state is not None and (
-            (a_state != last_a_state) or (b_state != last_b_state)):
-        if a_state == 1:
-            pos += 1
-            sample_pulses += 1
+    while True:
+        a_state = pinA.value()
+        b_state = pinB.value()
+        poll_count += 1
 
-            # Count one full revolution when the quadrature state reaches the high-high pattern.
-            if b_state == 1 and a_state == 1:
-                rotations += 1
-                sample_rotations += 1
+        if (a_state != last_a_state) or (b_state != last_b_state):
+            if a_state == 1:
+                with encoder_lock:
+                    pos += 1
+                    sample_pulses += 1
+                    if b_state == 1:
+                        rotations += 1
+                        sample_rotations += 1
 
-    last_a_state = a_state
-    last_b_state = b_state
+        last_a_state = a_state
+        last_b_state = b_state
 
 
 TUNABLES = ("kp", "ki", "kd", "ramp", "db")
@@ -278,18 +304,26 @@ def main_loop():
     keyboard_thread = threading.Thread(target=keyboard_input_loop, daemon=True)
     keyboard_thread.start()
 
+    # The encoder gets its own thread so the print and sleep below cannot
+    # starve it. See encoder_thread() for why that matters.
+    threading.Thread(target=encoder_thread, daemon=True).start()
+
     last_motion = time.monotonic()
+    last_print_time = time.monotonic()
+    last_poll_count = 0
+    last_poll_time = time.monotonic()
+    poll_hz = 0.0
 
     while True:
-        update_encoder()
-
         now = time.monotonic()
 
         # Update RPM estimate on a fixed sample interval.
         if now - last_sample_time >= SAMPLE_INTERVAL_SECONDS:
             elapsed_seconds = now - last_sample_time
-            rpm = calculate_rpm(sample_pulses, elapsed_seconds)
-            sample_pulses = 0
+            with encoder_lock:
+                pulses = sample_pulses
+                sample_pulses = 0
+            rpm = calculate_rpm(pulses, elapsed_seconds)
             last_sample_time = now
 
         if rpm > 5.0:
@@ -336,12 +370,25 @@ def main_loop():
 
         handle_keyboard()
 
-        sys.stdout.write(
-            f"\rpulses {pos:7d} | RPM: {rpm:6.1f} | Target: {target_rpm:6.1f} "
-            f"| Throttle: {throttle:5.2f} | angle {NEUTRAL_ANGLE + DIRECTION * throttle:6.1f}   "
-        )
-        sys.stdout.flush()
-        time.sleep(0.001)
+        # Print at ~5 Hz, not every pass. The write and flush used to run
+        # thousands of times a second and were a large part of what slowed the
+        # encoder sampling down. Nothing is lost - the eye cannot read faster.
+        if now - last_print_time >= 0.2:
+            dt_poll = now - last_poll_time
+            if dt_poll > 0:
+                poll_hz = (poll_count - last_poll_count) / dt_poll
+            last_poll_count, last_poll_time = poll_count, now
+            last_print_time = now
+
+            sys.stdout.write(
+                f"\rpulses {pos:7d} | RPM: {rpm:6.1f} | Target: {target_rpm:6.1f} "
+                f"| Throttle: {throttle:5.2f} "
+                f"| angle {NEUTRAL_ANGLE + DIRECTION * throttle:6.1f} "
+                f"| poll {poll_hz / 1000:5.1f}kHz   "
+            )
+            sys.stdout.flush()
+
+        time.sleep(0.002)
 
 
 try:
