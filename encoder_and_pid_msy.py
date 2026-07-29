@@ -66,18 +66,28 @@ last_control_time = time.monotonic()  # Time of the last PID update.
 #
 # Nothing is written back to this file, so when you land on numbers you like,
 # copy them in here before you lose the terminal.
-KP = 0.3                # Proportional gain.
-KI = 0.0005             # Integral gain.
-KD = 0.5                # Derivative gain.
+# CAREFUL - in this INCREMENTAL controller the terms are not what their names
+# suggest. throttle accumulates the output, so:
+#     KP term -> adds to throttle every tick   => acts as INTEGRAL action
+#     KD term -> responds to change in error   => acts as PROPORTIONAL action
+#     KI term -> integral of an integral       => DOUBLE integral, destabilising
+#
+# That is why KI is zero. Simulated with an inertia wheel, KI = 0.0005 (the old
+# value) overshoots by about 1450 RPM once the ramp clamp stops hiding it.
+# The old KP of 0.3 was roughly 2800x too high and only appeared stable because
+# the clamp saturated it into a slew-limited bang-bang controller.
+KP = 0.0010             # integral action  (was 0.3)
+KI = 0.0                # MUST stay 0 here (was 0.0005)
+KD = 0.020              # proportional damping  (was 0.5)
 
 # Maximum change to the throttle per control update. This is a rate limit that
 # sits AFTER the PID, so it caps how fast the flywheel can spin up no matter
 # what the gains are: at 0.1 per 0.1 s update, crossing the full 0..25 throttle
 # range takes 25 seconds. If spin-up feels hopelessly slow, this is the knob,
 # not the gains. Raise it with "ramp 0.5".
-MAX_ANGLE_CHANGE = 0.1
+MAX_ANGLE_CHANGE = 0.8  # was 0.1, which needed 25 s to cross the throttle range
 
-ERROR_DEADBAND = 10.0   # Ignore small RPM errors to reduce jitter.
+ERROR_DEADBAND = 15.0   # Ignore small RPM errors to reduce jitter.
 
 # Rule 5.5: tennis balls may not be launched above 12.0 m/s. On a 3 in flywheel
 # that is the RPM below. Typed targets are capped at it.
