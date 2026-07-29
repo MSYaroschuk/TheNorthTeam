@@ -2,17 +2,12 @@
 
 # encoder_and_pid_msy.py
 # Closed-loop flywheel speed control for the shooter.
-#
 # (C) Team Northeast
 #
-# Commands, typed while running:
-#   2000      spin up to 2000 RPM        0    stop
-#   kp 0.003  set a gain live            ?    show current settings
-#   kd 0.02                              q    quit
-#   ramp 0.8  throttle change limit
-#   db 20     ignore errors below this
-#
-# Gain changes are not written back to this file.
+# Type while running:
+#   2000  target RPM      kp 0.003 / kd 0.02 / ramp 0.8 / db 20  set a gain
+#   0     stop            ?  show settings        q  quit
+# Gain changes are not saved back to this file.
 
 import math
 import sys
@@ -32,13 +27,9 @@ MOTOR_CHANNEL = 2
 CHANNEL_A = 17
 CHANNEL_B = 4
 
-# The ESC stops at NEUTRAL_ANGLE, not at 0, and DIRECTION selects which side of
-# neutral drives the shooting direction. DIRECTION must never multiply the
-# neutral value itself or "stop" becomes a throttle command the other way:
-#
-#     angle = NEUTRAL_ANGLE + DIRECTION * throttle       throttle 0 = stopped
-#
-# Consistent with the chassis code, where 5 + (-1 * 25) = -20 is full speed.
+# angle = NEUTRAL_ANGLE + DIRECTION * throttle, so throttle 0 is a real stop.
+# DIRECTION must never multiply NEUTRAL_ANGLE or "stop" becomes throttle the
+# other way. Matches the chassis code: 5 + (-1 * 25) = -20 is full speed.
 NEUTRAL_ANGLE = 5.0
 DIRECTION = -1
 MAX_THROTTLE = 25.0
@@ -47,78 +38,52 @@ MAX_THROTTLE = 25.0
 # SPEED MEASUREMENT
 # ==========================================================================
 
-# Counts registered per revolution. encoder_thread() counts twice per
-# quadrature cycle, so 16 implies 8 cycles per revolution.
-#
-# STILL UNCONFIRMED: measured over a single hand-turned revolution. Verify over
-# ten (expect 160). If the true figure is lower than this, RPM under-reports and
-# the shooter can exceed 12.0 m/s while the display still looks legal.
+# UNCONFIRMED - measured over one hand-turned revolution. Verify over ten
+# (expect 160). If the true value is lower, RPM under-reports and the shooter
+# can pass 12.0 m/s while the display still looks legal.
 PULSES_PER_REV = 16
 
-# Speed comes from the time spanned by this many pulses, not from counting
-# pulses in a fixed window. Counting quantises to (60/PULSES_PER_REV)/window,
-# which was 18.75 RPM steps - coarser than the accuracy the shot needs.
-#
-# The limit on the timing method is scheduler jitter in the encoder thread,
-# about 1 ms, not the poll clock. Since that error is roughly fixed in time, a
-# longer window dilutes it: 64 pulses spans ~120 ms at 2000 RPM and holds the
-# noise near 16 RPM.
+# Speed is the time spanned by this many pulses. Counting pulses in a fixed
+# window instead would quantise to 18.75 RPM steps. The limit here is ~1 ms of
+# scheduler jitter, not the poll clock, so a longer window dilutes it: 64
+# pulses spans ~120 ms at 2000 RPM and holds noise near 16 RPM.
 RPM_WINDOW_PULSES = 64
-RPM_STALE_SECONDS = 0.3      # no pulses this long means the wheel has stopped
+RPM_STALE_SECONDS = 0.3
 
 # ==========================================================================
 # CONTROL
 # ==========================================================================
 
-# This controller is INCREMENTAL - throttle accumulates the output - so the
-# terms do not do what their names suggest:
-#
-#     KP term  adds to throttle each tick     -> acts as INTEGRAL action
-#     KD term  responds to change in error    -> acts as PROPORTIONAL action
-#
-# There is deliberately no I term. Integrating an already-integrating output is
-# a double integral, and it drives the flywheel far past target.
+# Throttle accumulates the output, so the terms are not what their names say:
+# KP acts as integral action, KD as proportional. There is no I term on
+# purpose - integrating an integrating output drives the wheel past target.
 KP = 0.0020
 KD = 0.0200
 
-# Limit on throttle change per control update. This sits after the PID, so it
-# caps how fast the wheel can spin up regardless of the gains.
-MAX_ANGLE_CHANGE = 0.8
-
-# Ignore errors below this. Sits just above the measurement noise floor so the
-# controller does not chase noise.
-ERROR_DEADBAND = 20.0
-
+MAX_ANGLE_CHANGE = 0.8       # throttle change per update; caps spin-up rate
+ERROR_DEADBAND = 20.0        # sits just above the measurement noise floor
 CONTROL_INTERVAL_SECONDS = 0.1
 
-# Measured plant: rpm = 340 * throttle - 1544. The ESC produces nothing below
-# about throttle 4.5; everything under that is dead travel. Feedforward uses
-# this so the controller starts near the right throttle instead of walking up
-# from zero and leaving the integral to hold the whole operating point.
-#
-# RE-MEASURE after any change to the battery, ESC, wheel or belt: command a few
-# speeds, note the settled throttle, fit a line.
+# Measured: rpm = 340 * throttle - 1544. Nothing turns below throttle ~4.5.
+# Feedforward uses this so the controller starts near the right throttle.
+# Re-measure after any battery, ESC, wheel or belt change.
 RPM_PER_THROTTLE = 340.0
 THROTTLE_DEADBAND = 4.54
-
 MAX_TRIM = 4.0               # how far the PID may pull off the feedforward
 
 # ==========================================================================
 # SAFETY
 # ==========================================================================
 
-# Rule 5.5: tennis balls may not be launched above 12.0 m/s.
 FLYWHEEL_DIAMETER_IN = 3.0
 FLYWHEEL_RADIUS_M = FLYWHEEL_DIAMETER_IN * 0.0254 / 2.0
-MAX_LEGAL_RPM = (12.0 / FLYWHEEL_RADIUS_M) * 60.0 / (2.0 * math.pi)
+MAX_LEGAL_RPM = (12.0 / FLYWHEEL_RADIUS_M) * 60.0 / (2.0 * math.pi)  # rule 5.5
 
 STALL_SECONDS = 3.0          # commanded but not turning -> cut power
 
-# An under-reporting encoder makes the controller see a slow wheel and keep
-# adding throttle; the wheel accelerates while the display stays calm, and the
-# stall guard cannot catch it because the wheel is turning. Bounding the
-# throttle by what the target could plausibly need is the backstop. Headroom
-# applies only above the ESC's dead travel.
+# A failing encoder reads slow, so the controller adds throttle and the wheel
+# runs away while the display stays calm. Capping throttle at what the target
+# could plausibly need is the backstop; headroom applies above the dead travel.
 THROTTLE_HEADROOM = 1.6
 
 # ==========================================================================
@@ -133,7 +98,7 @@ pulse_count = 0
 poll_count = 0
 
 rpm = 0.0
-target_rpm = 0.0             # starts stopped; nothing spins until asked
+target_rpm = 0.0             # starts stopped
 throttle = 0.0
 trim = 0.0
 previous_error = 0.0
@@ -170,13 +135,9 @@ stop_motor()
 # ==========================================================================
 
 def encoder_thread():
-    """Poll the encoder on a dedicated thread.
-
-    This must not share a thread with printing or sleeping. Catching every edge
-    needs a poll faster than channel A's high time - 1067 Hz at 2000 RPM, 1600
-    at the legal ceiling - and a loop doing anything else falls below that.
-    Dropped pulses read as a slow wheel, so the controller adds throttle, which
-    drops more pulses. It runs away, and no gain change can fix it.
+    """Poll the encoder. Must not share a thread with printing or sleeping:
+    catching every edge needs 1600 Hz at the legal ceiling, and dropped pulses
+    read as a slow wheel, which makes the controller add throttle and run away.
     """
     global pulse_count, poll_count
 
@@ -273,7 +234,7 @@ def handle_commands():
         try:
             requested = float(line)
         except ValueError:
-            print(f"\n  '{line}' not understood - type a number, 'kd 0.02', or '?'")
+            print(f"\n  '{line}' not understood - number, 'kd 0.02', or '?'")
             continue
 
         if requested > MAX_LEGAL_RPM:
@@ -344,7 +305,7 @@ def main_loop():
 
         handle_commands()
 
-        # 5 Hz. Printing every pass starves the encoder thread.
+        # 5 Hz - printing every pass starves the encoder thread.
         if now - last_print >= 0.2:
             elapsed = now - last_poll_time
             if elapsed > 0:
@@ -364,7 +325,5 @@ try:
 except KeyboardInterrupt:
     print("\nExiting...")
 finally:
-    # finally, not just the KeyboardInterrupt handler: any crash must stop the
-    # motor too.
-    stop_motor()
+    stop_motor()             # any exit path must neutralise the motor
     print("Motor commanded to neutral.")
