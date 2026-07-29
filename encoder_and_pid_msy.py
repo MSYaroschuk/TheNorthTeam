@@ -115,6 +115,22 @@ pending_event = ""           # written into the next log row, then cleared
 
 LOG_RATE_HZ = 50             # fine enough to resolve the dip as a ball passes
 
+# A ball passing through the flywheel steals energy and the speed drops
+# sharply. That dip is the true instant of the shot, so it is detected here
+# rather than relying on how fast you can type - your label afterwards just
+# attaches to the most recent detected shot.
+# Compared as the mean of the older half of the window against the newer half.
+# Comparing a peak against a single sample instead triggers constantly on
+# +-16 RPM noise; averaging cuts that scatter to about 6 RPM, so 25 sits well
+# clear of it. Tested against synthetic traces: every ball found, no false
+# positives, and none in two minutes of noise with no shots at all.
+SHOT_DIP_RPM = 25.0
+SHOT_DEBOUNCE_S = 0.8        # ignore further dips this soon after one
+
+recent_rpm = deque(maxlen=30)    # ~0.6 s of history at LOG_RATE_HZ
+last_shot_time = 0.0
+last_shot_rpm = 0.0
+
 
 def clamp(value, low, high):
     return max(low, min(high, value))
@@ -189,21 +205,28 @@ def read_rpm():
 TUNABLES = ("kp", "kd", "ramp", "db")
 
 
-def mark_shot(text):
-    """Tag the log at the instant a ball is fired.
+def label_shot(text):
+    """Attach an outcome to the most recently detected shot.
 
-    's'              mark only
-    's 8.5'          landed 8.5 m out
-    's 8.5 -0.4'     8.5 m out, 0.4 m left of the aim line
+    Type it whenever you like after the shot - the shot's own timestamp and
+    speed came from the RPM dip, not from when you pressed the key.
 
-    Lateral offset is worth recording because flywheel speed cannot cause
-    left-right error - it only changes distance. So sideways scatter measures
-    the mechanical noise floor directly.
+        short / in / long        where it went relative to the bucket
+        long 0.5                 add how far out, if you can judge it
     """
     global pending_event
-    pending_event = "shot" if not text else f"shot:{text}"
-    print(f"\n  marked {pending_event} at {rpm:.0f} RPM "
-          f"({muzzle_mps(rpm):.2f} m/s)")
+
+    if not text:
+        print("\n  say short / in / long")
+        return
+    pending_event = f"label:{text}"
+
+    if last_shot_time <= 0:
+        print(f"\n  '{text}' recorded, but no shot was detected to attach it "
+              f"to - lower SHOT_DIP_RPM if the dip is being missed")
+        return
+    print(f"\n  '{text}' -> shot {time.monotonic() - last_shot_time:.1f}s ago "
+          f"at {last_shot_rpm:.0f} RPM ({muzzle_mps(last_shot_rpm):.2f} m/s)")
 
 
 def read_commands():
@@ -237,8 +260,11 @@ def handle_commands():
 
         parts = line.split()
 
+        if parts[0] in ("short", "in", "long"):
+            label_shot(line)
+            continue
         if parts[0] == "s":
-            mark_shot(" ".join(parts[1:]))
+            label_shot(" ".join(parts[1:]))
             continue
         if len(parts) == 1:
             for key in TUNABLES:                    # accept "kd0.02" too
@@ -291,13 +317,13 @@ def main_loop():
           f"(12.0 m/s); above that the line shows OVER.")
     print("Commands: <rpm> | 0 | kp 0.003 | kd 0.02 | ramp 0.8 | db 20 | ? | q")
 
-    global pending_event
+    global pending_event, last_shot_time, last_shot_rpm
 
     log_path = time.strftime("shots_%H%M%S.csv")
     log = open(log_path, "w", buffering=1)
     log.write("t,target,rpm,mps,throttle,trim,event\n")
-    print(f"Logging to {log_path}. On each shot type 's <distance> <lateral>', "
-          f"e.g. 's 8.5 -0.4'.")
+    print(f"Logging to {log_path}. Shots are detected automatically - just "
+          f"type short / in / long after each one.")
 
     threading.Thread(target=encoder_thread, daemon=True).start()
     threading.Thread(target=read_commands, daemon=True).start()
@@ -352,6 +378,23 @@ def main_loop():
         handle_commands()
 
         if now - last_log >= 1.0 / LOG_RATE_HZ or pending_event:
+            recent_rpm.append(rpm)
+
+            # Detect the ball: speed over the last 0.3 s dropped clear of
+            # where it sat the 0.3 s before that.
+            if (target_rpm > 0 and len(recent_rpm) == recent_rpm.maxlen
+                    and now - last_shot_time > SHOT_DEBOUNCE_S):
+                window = list(recent_rpm)
+                half = len(window) // 2
+                before = sum(window[:half]) / half
+                after = sum(window[half:]) / (len(window) - half)
+                if before - after > SHOT_DIP_RPM:
+                    last_shot_time = now
+                    last_shot_rpm = before
+                    pending_event = f"shot:{before:.0f}:{before - after:.0f}"
+                    print(f"\n  shot detected at {before:.0f} RPM "
+                          f"({muzzle_mps(before):.2f} m/s), dip {before - after:.0f}")
+
             log.write(f"{now - log_start:.3f},{target_rpm:.0f},{rpm:.1f},"
                       f"{muzzle_mps(rpm):.3f},{throttle:.3f},{trim:+.3f},"
                       f"{pending_event}\n")
