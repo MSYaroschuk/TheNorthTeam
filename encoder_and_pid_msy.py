@@ -61,11 +61,22 @@ last_b_state = None     # Previous state of channel B for edge detection.
 last_sample_time = time.monotonic()   # Time of the last RPM sample.
 last_control_time = time.monotonic()  # Time of the last PID update.
 
-# PID settings for controlling motor speed.
-KP = 0.3                # Proportional gain. .00015
+# PID settings. All five are LIVE-TUNABLE while running - type e.g. "kp 0.5"
+# and press Enter. These values are only the starting point at launch.
+#
+# Nothing is written back to this file, so when you land on numbers you like,
+# copy them in here before you lose the terminal.
+KP = 0.3                # Proportional gain.
 KI = 0.0005             # Integral gain.
 KD = 0.5                # Derivative gain.
-MAX_ANGLE_CHANGE = 0.1  # Maximum change to the throttle per PID update.
+
+# Maximum change to the throttle per control update. This is a rate limit that
+# sits AFTER the PID, so it caps how fast the flywheel can spin up no matter
+# what the gains are: at 0.1 per 0.1 s update, crossing the full 0..25 throttle
+# range takes 25 seconds. If spin-up feels hopelessly slow, this is the knob,
+# not the gains. Raise it with "ramp 0.5".
+MAX_ANGLE_CHANGE = 0.1
+
 ERROR_DEADBAND = 10.0   # Ignore small RPM errors to reduce jitter.
 
 # Rule 5.5: tennis balls may not be launched above 12.0 m/s. On a 3 in flywheel
@@ -149,27 +160,87 @@ def update_encoder():
     last_b_state = b_state
 
 
+TUNABLES = ("kp", "ki", "kd", "ramp", "db")
+
+
 def keyboard_input_loop():
-    """Read a new target RPM from the terminal and place it into the queue."""
+    """Read commands from the terminal and place them into the queue."""
     while True:
         try:
-            raw_value = input("Target RPM (0 to stop): ").strip()
+            raw_value = input("cmd (RPM / kp / ki / kd / ramp / db / ?): ").strip()
         except EOFError:
             break
         if raw_value:
             input_queue.put(raw_value)
 
 
+def show_settings():
+    print(f"\n  kp {KP:<10g} ki {KI:<10g} kd {KD:<10g}"
+          f"\n  ramp {MAX_ANGLE_CHANGE:<8g} db {ERROR_DEADBAND:<10g}"
+          f"  target {target_rpm:.0f} RPM")
+
+
 def handle_keyboard():
-    """Apply any newly queued target RPM values to the control loop."""
-    global target_rpm
+    """Apply queued commands.
+
+    A bare number is a target RPM. Anything else is a live gain change, so the
+    PID can be tuned without stopping the motor or restarting the program.
+    """
+    global target_rpm, KP, KI, KD, MAX_ANGLE_CHANGE, ERROR_DEADBAND
+    global integral_error
 
     while not input_queue.empty():
-        raw_value = input_queue.get()
+        raw_value = input_queue.get().strip().lower()
+        if not raw_value:
+            continue
+
+        if raw_value in ("?", "h", "help"):
+            show_settings()
+            continue
+
+        parts = raw_value.split()
+
+        # Accept "kp 0.5" and "kp0.5" alike.
+        if len(parts) == 1:
+            for key in TUNABLES:
+                if parts[0].startswith(key) and len(parts[0]) > len(key):
+                    parts = [key, parts[0][len(key):]]
+                    break
+
+        if len(parts) == 2 and parts[0] in TUNABLES:
+            key, text = parts
+            try:
+                value = float(text)
+            except ValueError:
+                print(f"\n  '{text}' is not a number - ignored")
+                continue
+
+            if key == "kp":
+                KP = value
+            elif key == "ki":
+                # Bumpless transfer: the output contains KI * integral_error,
+                # so rescale the accumulator to keep that product constant.
+                # Without this, changing KI mid-spin kicks the throttle.
+                if value > 0 and KI > 0:
+                    integral_error *= KI / value
+                else:
+                    integral_error = 0.0
+                KI = value
+            elif key == "kd":
+                KD = value
+            elif key == "ramp":
+                MAX_ANGLE_CHANGE = max(0.0, value)
+            elif key == "db":
+                ERROR_DEADBAND = max(0.0, value)
+
+            show_settings()
+            continue
+
         try:
             requested = float(raw_value)
         except ValueError:
-            print("\n  not a number - ignored")
+            print(f"\n  '{raw_value}' not understood. Type a number for target "
+                  f"RPM, 'kp 0.5' to set a gain, or '?' to show settings.")
             continue
 
         if requested > MAX_LEGAL_RPM:
@@ -189,6 +260,9 @@ def main_loop():
     print("Reading encoder... Press Ctrl+C to stop.")
     print(f"Motor is STOPPED until you type a target. Legal max "
           f"{MAX_LEGAL_RPM:.0f} RPM.")
+    print("Gains are live - 'kp 0.5', 'ki 0.001', 'kd 0.2', 'ramp 0.5', "
+          "'db 15'. '?' shows them.")
+    print("Gain changes are NOT saved - copy the good ones into the file.")
     print("Spin the flywheel by hand - 'pulses' should climb.")
 
     keyboard_thread = threading.Thread(target=keyboard_input_loop, daemon=True)
