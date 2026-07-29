@@ -36,14 +36,19 @@ SAMPLE_INTERVAL_SECONDS = 0.2
 # How often to update the motor control output.
 CONTROL_INTERVAL_SECONDS = 0.1
 
-# Number of quadrature pulses used for one full revolution in this setup.
+# Counts registered by update_encoder() per full revolution of the flywheel.
 #
-# UNVERIFIED - see calculate_rpm(). update_encoder() counts twice per quadrature
-# cycle (once when A rises, once when B changes while A is high), so 14 counts
-# per revolution implies 7 quadrature cycles per revolution. That is consistent
-# with a 28-tick goBILDA encoder. Confirm it with the pulse count on screen:
-# zero it by restarting, turn the shaft exactly 10 revolutions, expect 140.
-PULSES_PER_REV = 14
+# MEASURED at 16 over one hand-turned revolution. update_encoder() counts twice
+# per quadrature cycle (once when A rises, once when B changes while A is high),
+# so 16 counts implies 8 cycles = 32 quadrature ticks per revolution.
+#
+# CONFIRM THIS WITH TEN REVOLUTIONS, not one. Restart the script to zero the
+# count, turn the shaft through exactly 10 revolutions, and expect 160. A single
+# rotation can easily be off by a count or two from contact bounce or from
+# starting mid-cycle, and the error direction is not safe: if the true figure is
+# lower than what is set here, the RPM readout under-reports, and the shooter
+# will pass 12.0 m/s while the screen still says it is legal.
+PULSES_PER_REV = 16
 
 # Initialize the global state variables.
 pos = 0                 # Running position count from the encoder.
@@ -108,18 +113,17 @@ stop_motor()
 
 
 def calculate_rpm(pulses, elapsed_seconds):
-    """Convert the number of quadrature pulses observed over a time window into RPM.
+    """Convert the counts observed over a time window into RPM.
 
-    NOTE the 120.0. Converting pulses/second to RPM needs 60. The extra factor
-    of 2 here has never been checked against a known speed, so this may read
-    double the true RPM. It is left as-is because the current gains were tuned
-    against this number - but before trusting the m/s figure for a legal shot,
-    verify it (count 10 revolutions by hand, or film the wheel).
+    Revolutions per SECOND times 60 gives revolutions per MINUTE. This used to
+    multiply by 120, which had no justification and made every reading twice as
+    fast as reality. Together with the old PULSES_PER_REV of 14, the display was
+    over-reporting by a factor of (120/14) / (60/16) = 2.29.
     """
     if elapsed_seconds <= 0:
         return 0.0
     revolutions = pulses / PULSES_PER_REV
-    return (revolutions / elapsed_seconds) * 120.0
+    return (revolutions / elapsed_seconds) * 60.0
 
 
 def update_encoder():
