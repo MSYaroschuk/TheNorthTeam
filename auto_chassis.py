@@ -34,6 +34,35 @@ print(f"Setting confidence: {CONFIDENCE_THRESHOLD}")
 # no ball detections - wait then rotate to scan
 NO_DETECT_WAIT_TIME = 5.0
 
+# ponytail: after the ball is genuinely lost, coast forward briefly - it was
+# most likely just about to go under the intake hood where the camera cannot
+# see it. This is BLIND motion, so keep it short. Gated on had_ball so it
+# cannot fire at startup, when "no ball yet" would otherwise look like
+# "ball just lost" and drive the robot forward the moment it boots.
+LOST_BALL_PUSH_S = 1.0       # how long to keep DRIVING forward
+LOST_BALL_INTAKE_S = 3.0     # how long to keep the INTAKE running - longer,
+                             # because a ball already in the throat needs to
+                             # finish going in after the robot has stopped.
+LOST_BALL_PUSH_SPEED = 0.3
+
+# ponytail: search pattern. Spinning in place only ever sees one circle of the
+# field - if the nearest ball is outside it, the robot spins forever. Stepping
+# forward between sweeps covers new ground. The phase falls out of elapsed time
+# mod the cycle, so there is no scan state machine to get stuck in or reset.
+SCAN_SPIN_S = 5.0          # sweep in place...
+SCAN_ADVANCE_S = 1.0       # ...then drive forward this long, then repeat
+SCAN_SPIN_SPEED = 0.25
+SCAN_ADVANCE_SPEED = 0.3
+
+# ponytail: P-only steering - no integral, no derivative. A P controller with
+# no damping overshoots by nature, and two things here make that worse: the
+# loop only updates every ~130ms (inference lands on ~25% of frames), and
+# DRIVE_SPEED_SCALE multiplies this correction too, so raising the drive speed
+# raises steering aggression with it. Effective gain is STEERING_GAIN *
+# DRIVE_SPEED_SCALE. Lower this before reaching for a D term: D on a jittery
+# 7.5Hz signal amplifies detection noise more than it damps the swing.
+STEERING_GAIN = 0.4
+
 # screen resolution
 SCREEN_WIDTH = 640
 SCREEN_HEIGHT = 480
@@ -44,7 +73,16 @@ STOP_LINE_Y_PCT = 0.70
 # Confidence alone cannot separate them - time can. Tune these, not the threshold.
 BALL_CONFIRM_FRAMES = 2    # consecutive hits before we act on a ball
 BALL_MEMORY_S = 0.4        # keep steering at a remembered ball this long after it drops out
-BALL_MATCH_PX = 80         # a hit within this many px counts as the same ball
+BALL_MATCH_PX = 60         # base radius: same ball if within this many px...
+BALL_MATCH_PX_PER_S = 700  # ...plus this much per second of gap.
+# ponytail: a FIXED radius cannot work here. The sensor attaches inference to
+# only ~25% of frames, so consecutive detections are ~130ms apart, and while
+# the robot is scanning the scene sweeps past far faster than 80px in that
+# time. The ball then reads as a different object every frame, the streak
+# never reaches BALL_CONFIRM_FRAMES, and the robot scans forever - the lack of
+# a lock is what MAKES it rotate, which is what breaks the next match.
+# Scaling by the real elapsed gap tracks the physical limit (a ball can only
+# move so fast) instead of assuming a frame rate we do not have.
 
 # Fusion HAT+ PWM output channels
 SHOOTER_CH_1 = 7
@@ -59,8 +97,23 @@ MOTOR_RIGHT_CH_2 = 9
 
 # speed settings
 MOTOR_MAX_THROTTLE = 20  # max speed
-MOTOR_NEUTRAL = 5        # stopping speed
-INTAKE_SPEED = -20
+MOTOR_NEUTRAL = 5        # neutral per Daniel - ESCs calibrated to this, not 1500us
+INTAKE_SPEED = -28
+
+# ponytail: which way a motor spins is decided by how it is BOLTED ON, not by
+# the code. Flip a flag here instead of re-wiring or negating a speed at one
+# call site. Defaults reproduce the old behaviour: left pair as-is, right pair
+# mirrored, which is correct only if both motors on a side face the same way.
+INVERT_LEFT_1 = False    # channel 0
+INVERT_LEFT_2 = False    # channel 8
+INVERT_RIGHT_1 = False    # channel 1
+INVERT_RIGHT_2 = False    # channel 9
+
+# ponytail: ONE knob for how hard the drivetrain pushes. Applied inside
+# set_speed so every caller is covered - TRACKING, the intake creep, run-on and
+# SCANNING - without touching a single call site. The intake MOTOR is a separate
+# path (INTAKE_SPEED) and is deliberately NOT scaled. Set back to 1.0 to undo.
+DRIVE_SPEED_SCALE = 1.92   # 2x of the previous 0.96
 
 # acceleration / deceleration limits per tick
 ACCEL_LIMIT = 0.1
@@ -122,20 +175,28 @@ def _clamp(v, lo, hi):
 
 
 def parse_detections(imx500, picam2, metadata, labels, frame_w, frame_h):
-    """One frame's sensor metadata -> [(cx, cy, label, score), ...] in frame px.
+    """One frame's sensor metadata -> [(x, y, w, h, label, score), ...] in frame px.
 
-    Returns centroids because that is all the control loop uses. The sensor
+    Returns the FULL box, not just a centroid: the control loop only steers on
+    the centre, but the box is what YOLO actually produced and drawing it is how
+    you tell a good detection from a lucky one. The sensor
     reports boxes in letterboxed network-input space; convert_inference_coords()
     maps them back against the SAME request's metadata, so unlike the Edge
     Impulse path there is no manual scale_x/scale_y to get wrong.
     """
     outputs = imx500.get_outputs(metadata, add_batch=True)
     if outputs is None:
-        return []                    # no inference on this frame - normal at startup
+        # ponytail: None, not []. The sensor does not attach inference to EVERY
+        # frame - at 30 FPS capture with a slower network, many frames carry no
+        # result. Returning [] made the tracking gate read those as "ball gone",
+        # which broke the confirm streak every other frame and meant a real ball
+        # never reached BALL_CONFIRM_FRAMES. Boxes drew fine; the chassis never
+        # moved. The caller must skip the gate on these frames, not feed it a miss.
+        return None
 
     nms = unpack_edgemdt_nms(outputs)
     if nms is None:
-        return []
+        return None
     boxes, scores, classes, _n = nms
 
     input_w, input_h = imx500.get_input_size()
@@ -162,7 +223,7 @@ def parse_detections(imx500, picam2, metadata, labels, frame_w, frame_h):
         h = int(_clamp(h, 0, frame_h - y))
         if w <= 0 or h <= 0:
             continue
-        out.append((x + w // 2, y + h // 2, label, float(score)))
+        out.append((x, y, w, h, label, float(score)))
     return out
 
 
@@ -199,13 +260,14 @@ def set_speed(left_target, right_target):
     left_speed = limit_accel(left_speed, left_target)
     right_speed = limit_accel(right_speed, right_target)
 
-    left_angle = MOTOR_NEUTRAL + (left_speed * MOTOR_MAX_THROTTLE)
-    right_angle = MOTOR_NEUTRAL - (right_speed * MOTOR_MAX_THROTTLE)
+    def angle_for(speed, invert):
+        s = -speed if invert else speed
+        return MOTOR_NEUTRAL + (s * MOTOR_MAX_THROTTLE * DRIVE_SPEED_SCALE)
 
-    left_motor_1.angle(left_angle)
-    left_motor_2.angle(left_angle)
-    right_motor_1.angle(right_angle)
-    right_motor_2.angle(right_angle)
+    left_motor_1.angle(angle_for(left_speed, INVERT_LEFT_1))
+    left_motor_2.angle(angle_for(left_speed, INVERT_LEFT_2))
+    right_motor_1.angle(angle_for(right_speed, INVERT_RIGHT_1))
+    right_motor_2.angle(angle_for(right_speed, INVERT_RIGHT_2))
 
 def intake_start():
     global intake_running
@@ -228,7 +290,14 @@ def inference():
     # tracker only if we ever need to follow more than one ball.
     confirmed_ball = None    # last ball we trust
     confirmed_at = 0.0       # when we last saw it
-    hit_streak = 0           # consecutive frames matching confirmed_ball
+    hit_streak = 0           # consecutive INFERENCE frames matching confirmed_ball
+
+    had_ball = False         # gate for LOST_BALL_PUSH - see above
+
+    # Diagnostic: how much of the capture rate actually carries inference.
+    frames_with_inference = 0
+    frames_no_inference = 0
+    match_px = 0.0           # live tolerance, shown on the overlay
 
     picam2 = None   # ponytail: finally runs even if construction throws
 
@@ -281,8 +350,20 @@ def inference():
                     imx500, picam2, metadata, labels, frame_w, frame_h)
                 inference_time_ms = (time.perf_counter() - start_decode) * 1000
 
+                # A frame with no inference is not evidence of anything. Only
+                # frames the sensor actually ran the network on may advance or
+                # break the confirm streak.
+                inference_attached = detections is not None
+                if not inference_attached:
+                    detections = []
+                    frames_no_inference += 1
+                else:
+                    frames_with_inference += 1
+
                 if True:
-                    for center_x, center_y, label, score in detections:
+                    for bx, by, bw, bh, label, score in detections:
+                        center_x = bx + bw // 2
+                        center_y = by + bh // 2
                         obj = DetectedObject(center_x, center_y, score, label)
 
                         if "ball" in label:
@@ -299,11 +380,14 @@ def inference():
                             color = (0, 255, 0)
                             display_name = label.capitalize()
 
-                        cv2.circle(frame, (center_x, center_y), 6, color, -1)
-                        cv2.circle(frame, (center_x, center_y), 18, color, 3)
+                        # The actual YOLO box. The old fixed-radius circles were
+                        # a leftover drawing style and hid how well the box fits.
+                        cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
+                        cv2.circle(frame, (center_x, center_y), 3, color, -1)
                         
-                        text = f"{display_name} ({score:.2f})"
-                        cv2.putText(frame, text, (center_x + 15, center_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        text = f"{display_name} ({score:.2f}) {bw}x{bh}"
+                        label_y = by - 6 if by > 20 else by + bh + 16
+                        cv2.putText(frame, text, (bx, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 
                 # draw stopping line & pre-intake threshold
                 # ponytail: use the real frame size - picam2 align() may not
@@ -317,11 +401,15 @@ def inference():
                 # does not brake the robot. Kills phantom chasing AND lurching.
                 raw_ball = max(ball_list, key=lambda b: b.y) if ball_list else None
 
-                if raw_ball is not None:
+                if not inference_attached:
+                    pass                      # no evidence either way - hold state
+                elif raw_ball is not None:
+                    gap = max(0.0, now - confirmed_at) if confirmed_ball else 0.0
+                    match_px = BALL_MATCH_PX + BALL_MATCH_PX_PER_S * gap
                     same_ball = (
                         confirmed_ball is not None
-                        and abs(raw_ball.x - confirmed_ball.x) <= BALL_MATCH_PX
-                        and abs(raw_ball.y - confirmed_ball.y) <= BALL_MATCH_PX
+                        and abs(raw_ball.x - confirmed_ball.x) <= match_px
+                        and abs(raw_ball.y - confirmed_ball.y) <= match_px
                     )
                     hit_streak = hit_streak + 1 if same_ball else 1
                     confirmed_ball = raw_ball
@@ -343,6 +431,7 @@ def inference():
 
                 if tracked_ball is not None:
                     last_ball_time = now
+                    had_ball = True
                     closest_ball = tracked_ball
                     
                     cv2.putText(frame, f"Closest Ball: ({closest_ball.x}, {closest_ball.y})", (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 1)
@@ -357,11 +446,20 @@ def inference():
                     # APPROACHING BALL: proportional steering
                     else:
                         
+                        # ponytail: the intake is LATCHED - this branch used to
+                        # call neither intake_start nor intake_stop, so an intake
+                        # switched on below the line kept spinning while we tracked
+                        # a ball above it, until the ball left frame entirely.
+                        # Seeing the ball above the line is positive evidence it was
+                        # NOT swallowed. The run-on grace period is still honoured so
+                        # jitter across the line does not chatter the motor.
+                        if now > intake_until_time:
+                            intake_stop()
+
                         # Smooth speed reduction: slow down as ball gets closer so intake can grab it
                         proximity_ratio = min(1.0, closest_ball.y / stop_line_y)
                         
                         BASE_CRUISE_SPEED = 0.75 - (0.35 * proximity_ratio)
-                        STEERING_GAIN = 0.75
                         
                         # calculate error
                         screen_center_x = frame_w // 2
@@ -392,13 +490,43 @@ def inference():
                         set_speed(0.3, 0.3)  # ponytail: slow and STRAIGHT (equal L/R) - blind, so keep it short
                         cv2.putText(frame, "INTAKE RUN-ON", (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
                     else:
-                        intake_stop()
-                        if no_ball_elapsed > NO_DETECT_WAIT_TIME:  # Rotate to scan
-                            set_speed(0.25, -0.25)
-                            cv2.putText(frame, "SCANNING...", (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        # ponytail: two independent timers off the same event.
+                        # The ball leaves the bottom of the FRAME well before it
+                        # reaches the intake, so after it vanishes it is still on
+                        # its way in: drive forward briefly to close that gap,
+                        # and keep the intake running LONGER so a ball already in
+                        # the throat finishes going in after the robot stops.
+                        pushing = had_ball and no_ball_elapsed <= LOST_BALL_PUSH_S
+                        intaking = had_ball and no_ball_elapsed <= LOST_BALL_INTAKE_S
+
+                        if intaking:
+                            intake_start()
+                        else:
+                            intake_stop()
+
+                        if pushing:
+                            # Blind: nothing is steering this. Straight and short.
+                            set_speed(LOST_BALL_PUSH_SPEED, LOST_BALL_PUSH_SPEED)
+                            cv2.putText(frame, f"LOST - PUSHING ({LOST_BALL_PUSH_S - no_ball_elapsed:.1f}s)",
+                                        (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                        elif no_ball_elapsed > NO_DETECT_WAIT_TIME:  # Search
+                            scan_elapsed = no_ball_elapsed - NO_DETECT_WAIT_TIME
+                            phase = scan_elapsed % (SCAN_SPIN_S + SCAN_ADVANCE_S)
+                            if phase < SCAN_SPIN_S:
+                                set_speed(SCAN_SPIN_SPEED, -SCAN_SPIN_SPEED)
+                                cv2.putText(frame, f"SCANNING - SPIN ({SCAN_SPIN_S - phase:.1f}s)",
+                                            (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                            else:
+                                # Blind: no ball in sight and nothing steering.
+                                set_speed(SCAN_ADVANCE_SPEED, SCAN_ADVANCE_SPEED)
+                                remain = SCAN_SPIN_S + SCAN_ADVANCE_S - phase
+                                cv2.putText(frame, f"SCANNING - ADVANCE ({remain:.1f}s)",
+                                            (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
                         else:
                             set_speed(0.0, 0.0)
-                            cv2.putText(frame, "WAITING...", (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                            label = ("STOPPED - INTAKE ON "
+                                     f"({LOST_BALL_INTAKE_S - no_ball_elapsed:.1f}s)") if intaking else "WAITING..."
+                            cv2.putText(frame, label, (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
                 # performance log
                 end_loop_time = time.perf_counter()
@@ -410,7 +538,12 @@ def inference():
                 cv2.putText(frame, f"Left: {left_speed:.2f} | Right: {right_speed:.2f}", (15, 455), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
                 
                 trk = "LOCKED" if tracked_ball is not None else f"cand {hit_streak}/{BALL_CONFIRM_FRAMES}"
-                cv2.putText(frame, f"Track: {trk}", (15, 405), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+                _tot = frames_with_inference + frames_no_inference
+                _pct = (100.0 * frames_with_inference / _tot) if _tot else 0.0
+                cv2.putText(frame, f"Track: {trk}  |  inference on {_pct:.0f}% of frames",
+                            (15, 405), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+                cv2.putText(frame, f"Match tol: {match_px:.0f}px",
+                            (15, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
 
                 intake_text = "ON" if intake_running else "OFF"
                 cv2.putText(frame, f"Intake: {intake_text}", (15, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
